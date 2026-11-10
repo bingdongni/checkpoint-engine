@@ -272,13 +272,6 @@ def _inplace_pin_memory(files: list[str], rank: int | None = None) -> list[Memor
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
             memory_buffers = list(executor.map(_parse_and_pin_from_safetensors, files))
-        # Keep the temporary files until all registrations have succeeded.
-        for file, memory_buffer in zip(files, memory_buffers):
-            os.remove(file)
-            if memory_buffer.manually_pinned:
-                logger.info(
-                    f"[rank{rank}] inplace pin memory for file {file} finished, size {memory_buffer.size / 1024 / 1024:.2f}MiB"
-                )
     except BaseException:
         # Executor shutdown has joined all workers, including jobs still running after a failure.
         for memory_buffer in registrations:
@@ -290,6 +283,17 @@ def _inplace_pin_memory(files: list[str], rank: int | None = None) -> list[Memor
                 except Exception:  # noqa: BLE001
                     logger.exception(f"[rank{rank}] failed to roll back pinned memory")
         raise
+
+    # Unlinking is best effort once the buffers are registered.
+    for file, memory_buffer in zip(files, memory_buffers):
+        try:
+            os.remove(file)
+        except OSError as e:
+            logger.warning(f"[rank{rank}] failed to remove {file}: {e}")
+        if memory_buffer.manually_pinned:
+            logger.info(
+                f"[rank{rank}] inplace pin memory for file {file} finished, size {memory_buffer.size / 1024 / 1024:.2f}MiB"
+            )
     return memory_buffers
 
 

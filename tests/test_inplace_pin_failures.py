@@ -1,3 +1,4 @@
+import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -107,25 +108,55 @@ def test_register_checkpoint_preserves_shm_files_on_pin_failure(
         _assert_unpinned(cuda)
 
 
-def test_inplace_unlink_failure_unpins_registered_memory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "use_cuda",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=[
+                pytest.mark.gpu,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+            ],
+        ),
+    ],
+)
+def test_inplace_unlink_failure_keeps_registered_buffers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_cuda: bool
 ) -> None:
-    path = tmp_path / "weights.safetensors"
-    save_file({"weight": torch.arange(4096, dtype=torch.float32)}, str(path))
-    cuda = _CudaWithFailedRegistration()
+    paths = [tmp_path / f"{i}.safetensors" for i in range(3)]
+    expected = [torch.arange(4096 + i, dtype=torch.float32) for i in range(3)]
+    for path, tensor in zip(paths, expected):
+        save_file({"weight": tensor}, str(path))
+    cuda = _CudaWithFailedRegistration(torch.cuda.cudart() if use_cuda else None)
     cuda.failed.set()
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
+    if not use_cuda:
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cuda)
+    warnings = []
+    monkeypatch.setattr("checkpoint_engine.pin_memory.logger.warning", warnings.append)
+    real_remove = os.remove
 
-    def fail_remove(_path: str) -> None:
-        raise OSError("injected unlink failure")
+    def fail_second_remove(path: str) -> None:
+        if Path(path) == paths[1]:
+            raise PermissionError("injected unlink failure")
+        real_remove(path)
 
-    monkeypatch.setattr("checkpoint_engine.pin_memory.os.remove", fail_remove)
-    with pytest.raises(OSError, match="injected unlink failure"):
-        _inplace_pin_memory([str(path)])
-    _assert_unpinned(cuda)
-    assert path.exists()
+    monkeypatch.setattr("checkpoint_engine.pin_memory.os.remove", fail_second_remove)
+    buffers = _inplace_pin_memory([str(path) for path in paths])
+    try:
+        assert [path.exists() for path in paths] == [False, True, False]
+        assert len(buffers) == len(cuda.registered) == 3
+        assert not cuda.unregistered
+        assert any("injected unlink failure" in warning for warning in warnings)
+        for memory_buffer, tensor in zip(buffers, expected):
+            assert memory_buffer.manually_pinned
+            assert torch.equal(memory_buffer.buffer.view(dtype=torch.float32), tensor)
+    finally:
+        for memory_buffer in buffers:
+            if memory_buffer.manually_pinned:
+                assert cuda.cudaHostUnregister(memory_buffer.buffer.data_ptr()) == 0
 
 
 def test_inplace_submit_failure_waits_for_queued_workers(
